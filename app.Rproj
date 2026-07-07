@@ -1,0 +1,836 @@
+# ==============================================================================
+# Planora — Plan. Focus. Achieve.
+# A production-quality R Shiny Study Planner Application
+#
+# Features: Welcome page, Dashboard, Task CRUD, Search & Filters, Statistics,
+# Charts (Pie/Bar), Progress tracking, Deadlines, Achievement badges,
+# Daily study goals, Dark/Light mode, Purple-Black Glassmorphism UI.
+#
+# Author: Planora Team
+# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. LIBRARIES
+# ---------------------------------------------------------------------------
+library(shiny)
+library(shinyjs)
+library(bslib)
+library(DT)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(scales)
+
+# ---------------------------------------------------------------------------
+# 2. GLOBAL CONSTANTS & HELPERS
+# ---------------------------------------------------------------------------
+
+CSV_PATH <- "tasks.csv"
+
+SUBJECT_CHOICES <- c("Mathematics", "Physics", "Chemistry", "Biology",
+                     "Computer Science", "English", "History", "Economics",
+                     "Geography", "Other")
+
+CATEGORY_CHOICES <- c("Assignment", "Reading", "Revision", "Practice",
+                      "Project", "Lab", "Exam Prep", "Other")
+
+PRIORITY_CHOICES <- c("High", "Medium", "Low")
+
+DAILY_STUDY_GOAL_HOURS <- 4   # Default daily study goal (hours)
+
+# Ensure the CSV file exists; create with proper schema if missing.
+ensure_csv_exists <- function(path) {
+  if (!file.exists(path)) {
+    empty_df <- data.frame(
+      id = integer(0),
+      title = character(0),
+      subject = character(0),
+      category = character(0),
+      priority = character(0),
+      deadline = character(0),
+      study_hours = numeric(0),
+      completed = logical(0),
+      created_at = character(0),
+      stringsAsFactors = FALSE
+    )
+    write.csv(empty_df, path, row.names = FALSE)
+  }
+}
+
+# Safely load tasks from CSV with correct types.
+load_tasks <- function(path) {
+  ensure_csv_exists(path)
+  df <- tryCatch({
+    read.csv(path, stringsAsFactors = FALSE, colClasses = "character")
+  }, error = function(e) {
+    data.frame(id = character(0), title = character(0), subject = character(0),
+               category = character(0), priority = character(0),
+               deadline = character(0), study_hours = character(0),
+               completed = character(0), created_at = character(0),
+               stringsAsFactors = FALSE)
+  })
+  
+  if (nrow(df) == 0) {
+    df <- data.frame(
+      id = integer(0), title = character(0), subject = character(0),
+      category = character(0), priority = character(0),
+      deadline = as.Date(character(0)), study_hours = numeric(0),
+      completed = logical(0), created_at = character(0),
+      stringsAsFactors = FALSE
+    )
+    return(df)
+  }
+  
+  df$id <- as.integer(df$id)
+  df$study_hours <- as.numeric(df$study_hours)
+  df$completed <- as.logical(df$completed)
+  df$deadline <- as.Date(df$deadline)
+  df
+}
+
+# Persist the tasks data frame back to CSV.
+save_tasks <- function(df, path) {
+  out <- df
+  out$deadline <- as.character(out$deadline)
+  write.csv(out, path, row.names = FALSE)
+}
+
+# Generate the next unique task id.
+next_id <- function(df) {
+  if (nrow(df) == 0) return(1L)
+  max(df$id, na.rm = TRUE) + 1L
+}
+
+# Return a Font-Awesome-free emoji icon for a category.
+category_icon <- function(cat) {
+  switch(cat,
+         "Assignment" = "📝", "Reading" = "📖", "Revision" = "🔁",
+         "Practice" = "✏️", "Project" = "🛠️", "Lab" = "🧪",
+         "Exam Prep" = "🎯", "📌"
+  )
+}
+
+# Priority badge HTML class.
+priority_badge_class <- function(p) {
+  switch(p,
+         "High" = "badge-priority-high",
+         "Medium" = "badge-priority-medium",
+         "Low" = "badge-priority-low",
+         "badge-priority-low"
+  )
+}
+
+# ---------------------------------------------------------------------------
+# 3. ACHIEVEMENT DEFINITIONS
+# ---------------------------------------------------------------------------
+# Each achievement has: id, label, icon, and a function(tasks_df) -> logical
+ACHIEVEMENTS <- list(
+  list(id = "first_task", label = "First Step", icon = "🌱",
+       check = function(df) nrow(df) >= 1),
+  list(id = "five_done", label = "Getting Started", icon = "🔥",
+       check = function(df) sum(df$completed, na.rm = TRUE) >= 5),
+  list(id = "ten_done", label = "Task Master", icon = "🏆",
+       check = function(df) sum(df$completed, na.rm = TRUE) >= 10),
+  list(id = "all_done", label = "Perfectionist", icon = "💎",
+       check = function(df) nrow(df) > 0 && all(df$completed)),
+  list(id = "ten_hours", label = "Deep Focus", icon = "⏳",
+       check = function(df) sum(df$study_hours[df$completed], na.rm = TRUE) >= 10),
+  list(id = "no_overdue", label = "On Track", icon = "🛡️",
+       check = function(df) {
+         if (nrow(df) == 0) return(FALSE)
+         pending <- df[!df$completed, ]
+         nrow(pending) > 0 && !any(pending$deadline < Sys.Date(), na.rm = TRUE)
+       }),
+  list(id = "high_priority_done", label = "Priority Slayer", icon = "⚔️",
+       check = function(df) sum(df$completed & df$priority == "High", na.rm = TRUE) >= 3),
+  list(id = "planner_pro", label = "Planner Pro", icon = "📅",
+       check = function(df) nrow(df) >= 15)
+)
+
+# ==============================================================================
+# 4. USER INTERFACE
+# ==============================================================================
+
+ui <- tagList(
+  
+  # -- External resources -----------------------------------------------------
+  tags$head(
+    tags$title("Planora | Plan. Focus. Achieve."),
+    tags$link(rel = "stylesheet", type = "text/css", href = "style.css"),
+    tags$meta(name = "viewport", content = "width=device-width, initial-scale=1"),
+    # JS handler: updates the overall progress bar width/label when notified by the server
+    tags$script(HTML("
+      Shiny.addCustomMessageHandler('updateProgress', function(data) {
+        var bar = document.getElementById('overall_progress_bar');
+        if (bar) {
+          bar.style.width = data.pct + '%';
+          bar.innerHTML = data.pct + '%';
+        }
+      });
+    "))
+  ),
+  
+  useShinyjs(),
+  
+  # -- Top Navigation Bar -------------------------------------------------------
+  div(class = "planora-navbar",
+      div(
+        div(class = "planora-brand", "PLAN", tags$span("ORA")),
+        div(class = "planora-tagline", "Plan. Focus. Achieve.")
+      ),
+      div(class = "nav-links",
+          actionButton("nav_welcome", "Home", class = "btn-outline-planora btn-sm"),
+          actionButton("nav_dashboard", "Dashboard", class = "btn-outline-planora btn-sm"),
+          actionButton("nav_tasks", "Tasks", class = "btn-outline-planora btn-sm"),
+          actionButton("nav_achievements", "Achievements", class = "btn-outline-planora btn-sm"),
+          actionButton("toggle_theme", "Theme", class = "btn-planora btn-sm")
+      )
+  ),
+  
+  # -- Main Content: switches between pages via a hidden radio-like state ------
+  uiOutput("page_content"),
+  
+  # -- Footer --------------------------------------------------------------------
+  div(class = "planora-footer",
+      HTML("&copy; 2026 Planora &mdash; Built with R Shiny &middot; Plan. Focus. Achieve.")
+  )
+)
+
+# ------------------------------------------------------------------------------
+# 4a. PAGE: WELCOME
+# ------------------------------------------------------------------------------
+welcome_page <- function() {
+  div(class = "welcome-hero",
+      div(class = "welcome-title", "Welcome to Planora"),
+      div(class = "welcome-subtitle",
+          "Your all-in-one study companion. Organize tasks, track deadlines, ",
+          "and build the habits that turn plans into achievements."),
+      div(class = "welcome-features",
+          div(class = "feature-pill", "📋 Smart Task Manager"),
+          div(class = "feature-pill", "📊 Visual Statistics"),
+          div(class = "feature-pill", "⏰ Deadline Alerts"),
+          div(class = "feature-pill", "🏆 Achievement Badges"),
+          div(class = "feature-pill", "🌓 Dark / Light Mode")
+      ),
+      div(
+        actionButton("welcome_get_started", "Get Started", class = "btn-planora btn-lg"),
+        actionButton("welcome_view_tasks", "View My Tasks", class = "btn-outline-planora btn-lg",
+                     style = "margin-left: 12px;")
+      )
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 4b. PAGE: DASHBOARD
+# ------------------------------------------------------------------------------
+dashboard_page <- function() {
+  div(style = "padding: 24px 32px;",
+      
+      div(class = "section-title", "📊 Your Study Dashboard"),
+      
+      # Statistics Cards
+      fluidRow(
+        column(3, div(class = "stat-card",
+                      div(class = "stat-number", textOutput("stat_total", inline = TRUE)),
+                      div(class = "stat-label", "Total Tasks"))),
+        column(3, div(class = "stat-card",
+                      div(class = "stat-number", textOutput("stat_completed", inline = TRUE)),
+                      div(class = "stat-label", "Completed"))),
+        column(3, div(class = "stat-card",
+                      div(class = "stat-number", textOutput("stat_pending", inline = TRUE)),
+                      div(class = "stat-label", "Pending"))),
+        column(3, div(class = "stat-card",
+                      div(class = "stat-number", textOutput("stat_overdue", inline = TRUE)),
+                      div(class = "stat-label", "Overdue")))
+      ),
+      
+      br(),
+      
+      fluidRow(
+        # Progress + Daily Goal
+        column(6,
+               div(class = "glass-card",
+                   div(class = "section-title", "🎯 Overall Progress"),
+                   div(class = "progress",
+                       div(id = "overall_progress_bar", class = "progress-bar-planora",
+                           style = "width: 0%;", "0%")
+                   ),
+                   br(),
+                   div(class = "section-title", "📅 Daily Study Goal"),
+                   uiOutput("daily_goal_ui")
+               )
+        ),
+        # Pie chart
+        column(6,
+               div(class = "glass-card",
+                   div(class = "section-title", "🥧 Tasks by Category"),
+                   plotOutput("pie_chart", height = "260px")
+               )
+        )
+      ),
+      
+      fluidRow(
+        # Bar chart
+        column(6,
+               div(class = "glass-card",
+                   div(class = "section-title", "📈 Study Hours by Subject"),
+                   plotOutput("bar_chart", height = "280px")
+               )
+        ),
+        # Upcoming & overdue
+        column(6,
+               div(class = "glass-card",
+                   div(class = "section-title", "⏰ Upcoming Deadlines"),
+                   uiOutput("upcoming_deadlines_ui")
+               ),
+               div(class = "glass-card",
+                   div(class = "section-title", "🚨 Overdue Alerts"),
+                   uiOutput("overdue_alerts_ui")
+               )
+        )
+      )
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 4c. PAGE: TASKS (Add / Edit / Delete / Search / Filter)
+# ------------------------------------------------------------------------------
+tasks_page <- function() {
+  div(style = "padding: 24px 32px;",
+      
+      div(class = "section-title", "🗂️ Manage Your Tasks"),
+      
+      fluidRow(
+        # Left: Add / Edit form
+        column(4,
+               div(class = "glass-card",
+                   uiOutput("form_title_ui"),
+                   textInput("task_title", "Task Title", placeholder = "e.g. Finish Algebra Homework"),
+                   selectInput("task_subject", "Subject", choices = SUBJECT_CHOICES),
+                   selectInput("task_category", "Category", choices = CATEGORY_CHOICES),
+                   selectInput("task_priority", "Priority", choices = PRIORITY_CHOICES),
+                   dateInput("task_deadline", "Deadline", value = Sys.Date() + 3),
+                   numericInput("task_study_hours", "Estimated Study Hours",
+                                value = 1, min = 0.5, max = 24, step = 0.5),
+                   br(),
+                   div(
+                     actionButton("btn_save_task", "➕ Add Task", class = "btn-planora", width = "48%"),
+                     actionButton("btn_cancel_edit", "Cancel", class = "btn-outline-planora",
+                                  width = "48%", style = "margin-left: 4%;")
+                   )
+               )
+        ),
+        
+        # Right: Search, Filters, Task List
+        column(8,
+               div(class = "glass-card",
+                   fluidRow(
+                     column(6, textInput("search_tasks", NULL, placeholder = "🔍 Search tasks...")),
+                     column(3, selectInput("filter_subject", NULL, choices = c("All Subjects", SUBJECT_CHOICES))),
+                     column(3, selectInput("filter_priority", NULL, choices = c("All Priorities", PRIORITY_CHOICES)))
+                   ),
+                   fluidRow(
+                     column(4, selectInput("filter_category", NULL, choices = c("All Categories", CATEGORY_CHOICES))),
+                     column(4, selectInput("filter_status", NULL,
+                                           choices = c("All Status", "Completed", "Pending", "Overdue"))),
+                     column(4, selectInput("sort_by", NULL,
+                                           choices = c("Sort: Deadline" = "deadline",
+                                                       "Sort: Priority" = "priority",
+                                                       "Sort: Subject" = "subject",
+                                                       "Sort: Created" = "created_at")))
+                   )
+               ),
+               div(class = "glass-card",
+                   uiOutput("task_list_ui")
+               )
+        )
+      )
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 4d. PAGE: ACHIEVEMENTS
+# ------------------------------------------------------------------------------
+achievements_page <- function() {
+  div(style = "padding: 24px 32px;",
+      div(class = "section-title", "🏆 Your Achievements"),
+      div(class = "glass-card",
+          p(style = "color: var(--text-muted);",
+            "Unlock badges as you complete tasks and build strong study habits!"),
+          uiOutput("achievements_ui")
+      )
+  )
+}
+
+# ==============================================================================
+# 5. SERVER LOGIC
+# ==============================================================================
+
+server <- function(input, output, session) {
+  
+  # ---------------------------------------------------------------------------
+  # 5.1 Reactive State
+  # ---------------------------------------------------------------------------
+  tasks_data   <- reactiveVal(load_tasks(CSV_PATH))   # master task table
+  current_page <- reactiveVal("welcome")               # active page
+  edit_id      <- reactiveVal(NULL)                     # id being edited (NULL = adding)
+  dark_mode    <- reactiveVal(TRUE)                     # TRUE = dark theme
+  
+  # ---------------------------------------------------------------------------
+  # 5.2 Navigation
+  # ---------------------------------------------------------------------------
+  observeEvent(input$nav_welcome, current_page("welcome"))
+  observeEvent(input$nav_dashboard, current_page("dashboard"))
+  observeEvent(input$nav_tasks, current_page("tasks"))
+  observeEvent(input$nav_achievements, current_page("achievements"))
+  observeEvent(input$welcome_get_started, current_page("dashboard"))
+  observeEvent(input$welcome_view_tasks, current_page("tasks"))
+  
+  output$page_content <- renderUI({
+    switch(current_page(),
+           "welcome"      = welcome_page(),
+           "dashboard"    = dashboard_page(),
+           "tasks"        = tasks_page(),
+           "achievements" = achievements_page(),
+           welcome_page()
+    )
+  })
+  
+  # ---------------------------------------------------------------------------
+  # 5.3 Dark / Light Mode Toggle
+  # ---------------------------------------------------------------------------
+  observeEvent(input$toggle_theme, {
+    dark_mode(!dark_mode())
+    if (dark_mode()) {
+      removeCssClass(selector = "body", class = "light-mode")
+    } else {
+      addCssClass(selector = "body", class = "light-mode")
+    }
+  })
+  
+  # ---------------------------------------------------------------------------
+  # 5.4 Add / Edit Task Form Behaviour
+  # ---------------------------------------------------------------------------
+  
+  output$form_title_ui <- renderUI({
+    if (is.null(edit_id())) {
+      div(class = "section-title", "➕ Add New Task")
+    } else {
+      div(class = "section-title", "✏️ Edit Task")
+    }
+  })
+  
+  # Reset form to blank "Add" state
+  reset_form <- function() {
+    updateTextInput(session, "task_title", value = "")
+    updateSelectInput(session, "task_subject", selected = SUBJECT_CHOICES[1])
+    updateSelectInput(session, "task_category", selected = CATEGORY_CHOICES[1])
+    updateSelectInput(session, "task_priority", selected = PRIORITY_CHOICES[2])
+    updateDateInput(session, "task_deadline", value = Sys.Date() + 3)
+    updateNumericInput(session, "task_study_hours", value = 1)
+    edit_id(NULL)
+    updateActionButton(session, "btn_save_task", label = "➕ Add Task")
+  }
+  
+  # Cancel edit -> reset
+  observeEvent(input$btn_cancel_edit, {
+    reset_form()
+  })
+  
+  # Save (Add or Update) task
+  observeEvent(input$btn_save_task, {
+    
+    # --- Validation ---
+    if (trimws(input$task_title) == "") {
+      showNotification("Please enter a task title.", type = "error")
+      return(NULL)
+    }
+    if (is.na(input$task_study_hours) || input$task_study_hours <= 0) {
+      showNotification("Study hours must be a positive number.", type = "error")
+      return(NULL)
+    }
+    if (is.null(input$task_deadline) || is.na(input$task_deadline)) {
+      showNotification("Please choose a valid deadline.", type = "error")
+      return(NULL)
+    }
+    
+    df <- tasks_data()
+    
+    if (is.null(edit_id())) {
+      # --- ADD new task ---
+      new_row <- data.frame(
+        id = next_id(df),
+        title = trimws(input$task_title),
+        subject = input$task_subject,
+        category = input$task_category,
+        priority = input$task_priority,
+        deadline = as.Date(input$task_deadline),
+        study_hours = as.numeric(input$task_study_hours),
+        completed = FALSE,
+        created_at = as.character(Sys.Date()),
+        stringsAsFactors = FALSE
+      )
+      df <- rbind(df, new_row)
+      showNotification("Task added successfully!", type = "message")
+    } else {
+      # --- UPDATE existing task ---
+      idx <- which(df$id == edit_id())
+      if (length(idx) == 1) {
+        df$title[idx]       <- trimws(input$task_title)
+        df$subject[idx]     <- input$task_subject
+        df$category[idx]    <- input$task_category
+        df$priority[idx]    <- input$task_priority
+        df$deadline[idx]    <- as.Date(input$task_deadline)
+        df$study_hours[idx] <- as.numeric(input$task_study_hours)
+        showNotification("Task updated successfully!", type = "message")
+      }
+    }
+    
+    tasks_data(df)
+    save_tasks(df, CSV_PATH)
+    reset_form()
+  })
+  
+  # Populate form for editing when an "Edit" button is clicked (dynamic ids)
+  observeEvent(input$edit_task_id, {
+    req(input$edit_task_id)
+    df <- tasks_data()
+    row <- df[df$id == as.integer(input$edit_task_id), ]
+    if (nrow(row) == 1) {
+      updateTextInput(session, "task_title", value = row$title)
+      updateSelectInput(session, "task_subject", selected = row$subject)
+      updateSelectInput(session, "task_category", selected = row$category)
+      updateSelectInput(session, "task_priority", selected = row$priority)
+      updateDateInput(session, "task_deadline", value = row$deadline)
+      updateNumericInput(session, "task_study_hours", value = row$study_hours)
+      edit_id(row$id)
+      updateActionButton(session, "btn_save_task", label = "💾 Update Task")
+    }
+  }, ignoreInit = TRUE)
+  
+  # Delete a task (dynamic ids)
+  observeEvent(input$delete_task_id, {
+    req(input$delete_task_id)
+    df <- tasks_data()
+    df <- df[df$id != as.integer(input$delete_task_id), ]
+    tasks_data(df)
+    save_tasks(df, CSV_PATH)
+    showNotification("Task deleted.", type = "warning")
+  }, ignoreInit = TRUE)
+  
+  # Toggle complete/incomplete (dynamic ids)
+  observeEvent(input$toggle_complete_id, {
+    req(input$toggle_complete_id)
+    df <- tasks_data()
+    idx <- which(df$id == as.integer(input$toggle_complete_id))
+    if (length(idx) == 1) {
+      df$completed[idx] <- !df$completed[idx]
+      tasks_data(df)
+      save_tasks(df, CSV_PATH)
+      status_msg <- if (df$completed[idx]) "Marked complete! Great job! 🎉" else "Marked as pending."
+      showNotification(status_msg, type = "message")
+    }
+  }, ignoreInit = TRUE)
+  
+  # ---------------------------------------------------------------------------
+  # 5.5 Filtered Task List (search + filters + sort)
+  # ---------------------------------------------------------------------------
+  filtered_tasks <- reactive({
+    df <- tasks_data()
+    if (nrow(df) == 0) return(df)
+    
+    # Search
+    if (!is.null(input$search_tasks) && trimws(input$search_tasks) != "") {
+      q <- tolower(trimws(input$search_tasks))
+      df <- df[grepl(q, tolower(df$title)) | grepl(q, tolower(df$subject)) |
+                 grepl(q, tolower(df$category)), ]
+    }
+    
+    # Subject filter
+    if (!is.null(input$filter_subject) && input$filter_subject != "All Subjects") {
+      df <- df[df$subject == input$filter_subject, ]
+    }
+    
+    # Priority filter
+    if (!is.null(input$filter_priority) && input$filter_priority != "All Priorities") {
+      df <- df[df$priority == input$filter_priority, ]
+    }
+    
+    # Category filter
+    if (!is.null(input$filter_category) && input$filter_category != "All Categories") {
+      df <- df[df$category == input$filter_category, ]
+    }
+    
+    # Status filter
+    if (!is.null(input$filter_status)) {
+      if (input$filter_status == "Completed") {
+        df <- df[df$completed == TRUE, ]
+      } else if (input$filter_status == "Pending") {
+        df <- df[df$completed == FALSE, ]
+      } else if (input$filter_status == "Overdue") {
+        df <- df[df$completed == FALSE & df$deadline < Sys.Date(), ]
+      }
+    }
+    
+    # Sort
+    if (nrow(df) > 0 && !is.null(input$sort_by)) {
+      df <- switch(input$sort_by,
+                   "deadline" = df[order(df$deadline), ],
+                   "priority" = df[order(factor(df$priority, levels = c("High", "Medium", "Low"))), ],
+                   "subject"  = df[order(df$subject), ],
+                   "created_at" = df[order(df$created_at, decreasing = TRUE), ],
+                   df
+      )
+    }
+    
+    df
+  })
+  
+  # ---------------------------------------------------------------------------
+  # 5.6 Render Task List (cards with Edit/Delete/Complete buttons)
+  # ---------------------------------------------------------------------------
+  output$task_list_ui <- renderUI({
+    df <- filtered_tasks()
+    
+    if (nrow(df) == 0) {
+      return(div(style = "text-align:center; padding: 40px; color: var(--text-muted);",
+                 "No tasks found. Try adjusting your filters or add a new task!"))
+    }
+    
+    task_rows <- lapply(seq_len(nrow(df)), function(i) {
+      row <- df[i, ]
+      is_overdue <- !row$completed && row$deadline < Sys.Date()
+      item_class <- paste("task-item",
+                          if (row$completed) "completed" else "",
+                          if (is_overdue) "overdue" else "")
+      
+      div(class = item_class,
+          div(style = "flex: 1;",
+              div(class = "task-title",
+                  paste(category_icon(row$category), row$title)),
+              div(class = "task-meta",
+                  span(class = "badge-category", row$subject),
+                  " ",
+                  span(class = priority_badge_class(row$priority), row$priority),
+                  " ",
+                  tags$small(
+                    paste0(" | Due: ", format(row$deadline, "%d %b %Y"),
+                           " | ", row$study_hours, "h | ", row$category)
+                  ),
+                  if (is_overdue) tags$span(style = "color: var(--danger); font-weight:700;", " (OVERDUE)")
+              )
+          ),
+          div(style = "display:flex; gap:6px; flex-wrap: wrap;",
+              actionButton(paste0("complete_", row$id),
+                           label = if (row$completed) "↺ Undo" else "✔ Complete",
+                           class = "btn-outline-planora btn-sm",
+                           onclick = sprintf(
+                             "Shiny.setInputValue('toggle_complete_id', %d, {priority: 'event'})",
+                             row$id)),
+              actionButton(paste0("edit_", row$id), "✏️ Edit",
+                           class = "btn-outline-planora btn-sm",
+                           onclick = sprintf(
+                             "Shiny.setInputValue('edit_task_id', %d, {priority: 'event'})",
+                             row$id)),
+              actionButton(paste0("delete_", row$id), "🗑️ Delete",
+                           class = "btn-danger-soft btn-sm",
+                           onclick = sprintf(
+                             "Shiny.setInputValue('delete_task_id', %d, {priority: 'event'})",
+                             row$id))
+          )
+      )
+    })
+    
+    do.call(tagList, task_rows)
+  })
+  
+  # ---------------------------------------------------------------------------
+  # 5.7 Statistics Cards
+  # ---------------------------------------------------------------------------
+  output$stat_total <- renderText({
+    nrow(tasks_data())
+  })
+  
+  output$stat_completed <- renderText({
+    sum(tasks_data()$completed, na.rm = TRUE)
+  })
+  
+  output$stat_pending <- renderText({
+    df <- tasks_data()
+    sum(!df$completed, na.rm = TRUE)
+  })
+  
+  output$stat_overdue <- renderText({
+    df <- tasks_data()
+    sum(!df$completed & df$deadline < Sys.Date(), na.rm = TRUE)
+  })
+  
+  # ---------------------------------------------------------------------------
+  # 5.8 Progress Bar
+  # ---------------------------------------------------------------------------
+  observe({
+    df <- tasks_data()
+    pct <- if (nrow(df) == 0) 0 else round(100 * sum(df$completed, na.rm = TRUE) / nrow(df))
+    session$sendCustomMessage("updateProgress", list(pct = pct))
+  })
+  
+  # ---------------------------------------------------------------------------
+  # 5.9 Daily Study Goal
+  # ---------------------------------------------------------------------------
+  output$daily_goal_ui <- renderUI({
+    df <- tasks_data()
+    today_hours <- df %>%
+      filter(completed == TRUE, as.character(created_at) == as.character(Sys.Date())) %>%
+      summarise(h = sum(study_hours, na.rm = TRUE)) %>%
+      pull(h)
+    if (length(today_hours) == 0) today_hours <- 0
+    
+    pct <- min(100, round(100 * today_hours / DAILY_STUDY_GOAL_HOURS))
+    
+    tagList(
+      p(style = "color: var(--text-muted); margin-bottom: 6px;",
+        sprintf("%.1f / %d hours studied today", today_hours, DAILY_STUDY_GOAL_HOURS)),
+      div(class = "progress",
+          div(class = "progress-bar-planora", style = paste0("width: ", pct, "%;"),
+              paste0(pct, "%"))
+      ),
+      if (pct >= 100) {
+        div(style = "margin-top:8px; color: var(--success); font-weight:700;",
+            "🎉 Daily goal achieved! Keep up the momentum!")
+      } else {
+        div(style = "margin-top:8px; color: var(--text-muted);",
+            sprintf("%.1f hours to go — you can do it!", DAILY_STUDY_GOAL_HOURS - today_hours))
+      }
+    )
+  })
+  
+  # ---------------------------------------------------------------------------
+  # 5.10 Pie Chart — Tasks by Category
+  # ---------------------------------------------------------------------------
+  output$pie_chart <- renderPlot({
+    df <- tasks_data()
+    if (nrow(df) == 0) {
+      return(ggplot() + theme_void() +
+               annotate("text", x = 0, y = 0, label = "No data yet",
+                        color = "#b5b1c9", size = 6))
+    }
+    
+    cat_counts <- df %>% count(category, name = "n")
+    
+    ggplot(cat_counts, aes(x = "", y = n, fill = category)) +
+      geom_bar(stat = "identity", width = 1, color = "#0b0b12", linewidth = 1) +
+      coord_polar(theta = "y") +
+      scale_fill_manual(values = colorRampPalette(c("#c4b5fd", "#8b5cf6", "#6d28d9", "#3b1a78"))(nrow(cat_counts))) +
+      theme_void() +
+      theme(
+        legend.position = "right",
+        legend.text = element_text(color = "#f1f0f7", size = 11),
+        legend.title = element_blank(),
+        plot.background = element_rect(fill = "transparent", color = NA),
+        panel.background = element_rect(fill = "transparent", color = NA)
+      )
+  }, bg = "transparent")
+  
+  # ---------------------------------------------------------------------------
+  # 5.11 Bar Chart — Study Hours by Subject
+  # ---------------------------------------------------------------------------
+  output$bar_chart <- renderPlot({
+    df <- tasks_data()
+    if (nrow(df) == 0) {
+      return(ggplot() + theme_void() +
+               annotate("text", x = 0, y = 0, label = "No data yet",
+                        color = "#b5b1c9", size = 6))
+    }
+    
+    subj_hours <- df %>%
+      group_by(subject) %>%
+      summarise(hours = sum(study_hours, na.rm = TRUE)) %>%
+      arrange(desc(hours))
+    
+    ggplot(subj_hours, aes(x = reorder(subject, hours), y = hours)) +
+      geom_col(fill = "#8b5cf6", width = 0.6) +
+      coord_flip() +
+      labs(x = NULL, y = "Study Hours") +
+      theme_minimal(base_size = 13) +
+      theme(
+        text = element_text(color = "#f1f0f7"),
+        axis.text = element_text(color = "#f1f0f7"),
+        panel.grid.major = element_line(color = "rgba(255,255,255,0.08)"),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "transparent", color = NA),
+        panel.background = element_rect(fill = "transparent", color = NA)
+      )
+  }, bg = "transparent")
+  
+  # ---------------------------------------------------------------------------
+  # 5.12 Upcoming Deadlines & Overdue Alerts
+  # ---------------------------------------------------------------------------
+  output$upcoming_deadlines_ui <- renderUI({
+    df <- tasks_data()
+    upcoming <- df %>%
+      filter(completed == FALSE, deadline >= Sys.Date(),
+             deadline <= Sys.Date() + 7) %>%
+      arrange(deadline)
+    
+    if (nrow(upcoming) == 0) {
+      return(div(style = "color: var(--text-muted);", "No upcoming deadlines in the next 7 days."))
+    }
+    
+    tagList(lapply(seq_len(nrow(upcoming)), function(i) {
+      row <- upcoming[i, ]
+      days_left <- as.integer(row$deadline - Sys.Date())
+      div(class = "alert-upcoming",
+          sprintf("%s (%s) — due in %d day%s [%s]",
+                  row$title, row$subject, days_left,
+                  if (days_left == 1) "" else "s", format(row$deadline, "%d %b")))
+    }))
+  })
+  
+  output$overdue_alerts_ui <- renderUI({
+    df <- tasks_data()
+    overdue <- df %>%
+      filter(completed == FALSE, deadline < Sys.Date()) %>%
+      arrange(deadline)
+    
+    if (nrow(overdue) == 0) {
+      return(div(style = "color: var(--text-muted);", "No overdue tasks. Great job staying on track!"))
+    }
+    
+    tagList(lapply(seq_len(nrow(overdue)), function(i) {
+      row <- overdue[i, ]
+      days_over <- as.integer(Sys.Date() - row$deadline)
+      div(class = "alert-overdue",
+          sprintf("%s (%s) — overdue by %d day%s!",
+                  row$title, row$subject, days_over,
+                  if (days_over == 1) "" else "s"))
+    }))
+  })
+  
+  # ---------------------------------------------------------------------------
+  # 5.13 Achievement Badges
+  # ---------------------------------------------------------------------------
+  output$achievements_ui <- renderUI({
+    df <- tasks_data()
+    
+    badge_divs <- lapply(ACHIEVEMENTS, function(a) {
+      unlocked <- tryCatch(a$check(df), error = function(e) FALSE)
+      div(class = paste("achievement-badge", if (!unlocked) "locked" else ""),
+          div(class = "achievement-icon", a$icon),
+          div(a$label)
+      )
+    })
+    
+    div(style = "display:flex; flex-wrap:wrap; justify-content:center;",
+        do.call(tagList, badge_divs))
+  })
+  
+  # ---------------------------------------------------------------------------
+  # 5.14 Initial theme setup (dark by default)
+  # ---------------------------------------------------------------------------
+  # No action needed on load; body defaults to dark styling per CSS.
+}
+
+# ==============================================================================
+# 6. RUN APP
+# ==============================================================================
+shinyApp(ui = ui, server = server)
